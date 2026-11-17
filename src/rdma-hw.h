@@ -79,10 +79,10 @@ public:
 	Ptr<Packet> GetNxtPacket(Ptr<RdmaQueuePair> qp); // get next packet to send, inc snd_nxt  
 	
 	
-	uint8_t CalculatePersistenceRaw(Ptr<RdmaQueuePair> qp) const;  //Calculate persistence,8bit
-	void PktSent(Ptr<RdmaQueuePair> qp, Ptr<Packet> pkt, Time interframeGap); 
-	void UpdateNextAvail(Ptr<RdmaQueuePair> qp, Time interframeGap, uint32_t pkt_size);  
-	void ChangeRate(Ptr<RdmaQueuePair> qp, DataRate new_rate);    
+	uint8_t CalculatePersistenceRaw(Ptr<RdmaQueuePair> qp) const; 
+	void PktSent(Ptr<RdmaQueuePair> qp, Ptr<Packet> pkt, Time interframeGap);    
+	void UpdateNextAvail(Ptr<RdmaQueuePair> qp, Time interframeGap, uint32_t pkt_size); 
+	void ChangeRate(Ptr<RdmaQueuePair> qp, DataRate new_rate);       
 	/******************************
 	 * Mellanox's version of DCQCN
 	 *****************************/
@@ -168,17 +168,20 @@ public:
 	/******************************
 	 * FPDCC
 	 *****************************/
-	uint64_t m_fpdccK1;                  // Small queue threshold K1
+	uint64_t m_fpdccK1;               
 	uint64_t m_baseRtt = 12120;  
+	double m_fpdccQueueTargetRatio;      
+	uint64_t m_fpdccSns;              
+	uint32_t m_fpdccStage;          
 
 	int ReceivePnp(Ptr<Packet> p, CustomHeader &ch);
-        void HandlePnpFpdcc(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader &ch); //Process PNP and establish switch queue
-	void UpdateFpdccSwitchMeasurement(fpdcc_switch_record &record); //Update the H of the switch with two PNPs
-	void ResetFpdccSwitchValidityTimer(Ptr<RdmaQueuePair> qp, uint32_t swid, fpdcc_switch_record &record); //Reset the validity period of the switch record
-	void InvalidateFpdccSwitchRecord(Ptr<RdmaQueuePair> qp, uint32_t swid);
-	bool IsFpdccMainBottleneck(Ptr<RdmaQueuePair> qp, uint32_t currentSwid) const; //Find the maximum H
-	double CalculateFpdccNewRate(Ptr<RdmaQueuePair> qp, const fpdcc_switch_record &record) const; //Calculate the speed based on the main bottleneck
-	void TryFpdccRateAdjustment(Ptr<RdmaQueuePair> qp, uint32_t currentSwid); //Perform speed regulation after checking the main bottleneck and PSN
+        void HandlePnpFpdcc(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader &ch); 
+	void UpdateFpdccSwitchMeasurement(fpdcc_switch_record &record);
+	void ResetFpdccSwitchValidityTimer(Ptr<RdmaQueuePair> qp, uint32_t swid, fpdcc_switch_record &record);
+	void InvalidateFpdccSwitchRecord(Ptr<RdmaQueuePair> qp, uint32_t swid); 
+	bool IsFpdccMainBottleneck(Ptr<RdmaQueuePair> qp, uint32_t currentSwid) const; 
+	double CalculateFpdccNewRate(Ptr<RdmaQueuePair> qp, const fpdcc_switch_record &record) const;
+	void TryFpdccRateAdjustment(Ptr<RdmaQueuePair> qp, uint32_t currentSwid); 
 	
 	
 };

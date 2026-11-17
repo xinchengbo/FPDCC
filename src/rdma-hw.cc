@@ -187,6 +187,21 @@ TypeId RdmaHw::GetTypeId (void)
 				UintegerValue(5000),
 				MakeUintegerAccessor(&RdmaHw::m_fpdccK1),
 				MakeUintegerChecker<uint64_t>())
+		.AddAttribute("FpdccQueueTargetRatio",
+				"FPDCC queue target ratio, Qtarget=ratio*K1.",
+				DoubleValue(1.0),
+				MakeDoubleAccessor(&RdmaHw::m_fpdccQueueTargetRatio),
+				MakeDoubleChecker<double>(0.0, 1.0))
+		.AddAttribute("FpdccSns",
+				"FPDCC switch feedback state interval Te in ns.",
+				UintegerValue(2000),
+				MakeUintegerAccessor(&RdmaHw::m_fpdccSns),
+				MakeUintegerChecker<uint64_t>(1))
+		.AddAttribute("FpdccStage",
+				"FPDCC rate adjustment magnitude parameter.",
+				UintegerValue(2),
+				MakeUintegerAccessor(&RdmaHw::m_fpdccStage),
+				MakeUintegerChecker<uint32_t>(1))
 		;
 	return tid;
 }
@@ -523,8 +538,6 @@ void RdmaHw::QpComplete(Ptr<RdmaQueuePair> qp){
 		Simulator::Cancel(qp->mlx.m_rpTimer);
 	}
 
-	//FPDCC: Each switch record maintains an independent expiration timer.
-	// All flows must be cancelled upon completion to avoid scheduled callbacks continuing to hold and access completed QPs
 	if (m_cc_mode == 12){
 		for (auto &entry : qp->fpdcc.pnpRecords){
 			Simulator::Cancel(entry.second.validityEvent);
@@ -564,7 +577,6 @@ void RdmaHw::RedistributeQp(){
 	}
 }
 
-//FPDCC: Calculate the persistence of the flow
 uint8_t RdmaHw::CalculatePersistenceRaw(Ptr<RdmaQueuePair> qp) const{
 	if (qp == NULL || qp->m_totalNum == 0 || m_mtu == 0 ||
 		qp->m_baseRtt == 0 || qp->m_max_rate.GetBitRate() == 0){
@@ -577,14 +589,12 @@ uint8_t RdmaHw::CalculatePersistenceRaw(Ptr<RdmaQueuePair> qp) const{
 
 	const double S = static_cast<double>(qp->m_totalNum);
 	const double R = static_cast<double>(qp->m_lastNum);
-
-	// p = [0,1]
 	const double persistence = 1.0 - (1.0 - R / S) * baseBdpPackets / (R + baseBdpPackets);
-
-	//Quantify into [0,255]
 	uint32_t raw = static_cast<uint32_t>(persistence * 255.0 + 0.5);
 
-	if (raw > 255){raw = 255;}
+	if (raw > 255){
+		raw = 255;
+	}
 
 	return static_cast<uint8_t>(raw);
 }
@@ -1162,24 +1172,22 @@ void RdmaHw::UpdateRateHpPint(Ptr<RdmaQueuePair> qp, Ptr<Packet> p,
 	}
 }
 
+//-------------------------FPDCC------------------------------------------
 
-/******************************
- * FPDCC
- *****************************/
 int RdmaHw::ReceivePnp(Ptr<Packet> p, CustomHeader &ch){
 	if (m_cc_mode != 12){
 		return 0;
 	}
 	const uint16_t flowId = ch.pnp.flowid;
 	const uint16_t qid = ch.pnp.qid;
-	
-	Ptr<RdmaQueuePair> qp = GetQp(ch.sip, flowId, qid); 
+
+	Ptr<RdmaQueuePair> qp = GetQp(ch.sip, flowId, qid);  
 	
 	if (qp == NULL || qp->IsFinished()){
 		return 0;
 	}
 
-	HandlePnpFpdcc(qp, p, ch); 
+	HandlePnpFpdcc(qp, p, ch);  
 	return 0;
 	
 }
@@ -1187,25 +1195,22 @@ int RdmaHw::ReceivePnp(Ptr<Packet> p, CustomHeader &ch){
 void RdmaHw::HandlePnpFpdcc(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader &ch){
 	const uint32_t swid = ch.pnp.swid;
 	
-	// Construct this PNP record
 	const fpdcc_pnp_sample sample = {
 		ch.pnp.ts,
 		ch.pnp.qlen,
 		ch.pnp.A,
 		ch.pnp.W,
 		ch.pnp.bw,
-		ch.pnp.Z,
 		ch.pnp.seq
 	};
 	
 	auto it = qp->fpdcc.pnpRecords.find(swid);
 	
-	// If it does not exist, create a switch record and use the current PNP as the first baseline packet
 	if (it == qp->fpdcc.pnpRecords.end()){
 		fpdcc_switch_record record;
-		record.samples.push_back(sample);    
-		auto inserted = qp->fpdcc.pnpRecords.emplace(swid, record);   
-		ResetFpdccSwitchValidityTimer(qp, swid, inserted.first->second);    //Start a 5RTT with a valid time limit
+		record.samples.push_back(sample);   
+		auto inserted = qp->fpdcc.pnpRecords.emplace(swid, record);     
+		ResetFpdccSwitchValidityTimer(qp, swid, inserted.first->second);   
 		return;
 	}
 	
@@ -1216,12 +1221,12 @@ void RdmaHw::HandlePnpFpdcc(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader &
 		ResetFpdccSwitchValidityTimer(qp, swid, record);
 		return;
 	}
-
+	
 	if (sample.ts <= record.samples.back().ts ){
 		return;
 	}
 	
-	if (sample.ts - record.samples.back().ts <=  2000){
+	if (sample.ts - record.samples.back().ts <= m_fpdccSns){
 		return;
 	}
 
@@ -1231,10 +1236,8 @@ void RdmaHw::HandlePnpFpdcc(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader &
 
 	record.samples.push_back(sample);
 	
-	//Two valid PNP updates H
 	UpdateFpdccSwitchMeasurement(record);
 
-	//The current PNP has become a new valid measurement sample, and the 5 * BaseRTT validity period has been restarted
 	ResetFpdccSwitchValidityTimer(qp, swid, record);
 	
 	TryFpdccRateAdjustment(qp, swid);
@@ -1252,27 +1255,28 @@ void RdmaHw::UpdateFpdccSwitchMeasurement(fpdcc_switch_record &record){
 	const uint64_t deltaTs = s2.ts - s1.ts;
 	const uint64_t deltaA = s2.A - s1.A;
 
-	const double rin = static_cast<double>(deltaA) * 8.0 * 1e9 / static_cast<double>(deltaTs);   //Entry rate
+	const double rin =
+		static_cast<double>(deltaA) * 8.0 * 1e9 /
+		static_cast<double>(deltaTs);    
 
 	const double bottleneckBw = static_cast<double>(s2.bw);  
 
-	record.H = rin / bottleneckBw;   //Record the current bottleneck
+	record.H = rin / bottleneckBw;  
 }
 
-bool RdmaHw::IsFpdccMainBottleneck( Ptr<RdmaQueuePair> qp, uint32_t currentSwid) const{ //Determine the maximum bottleneck
+bool RdmaHw::IsFpdccMainBottleneck( Ptr<RdmaQueuePair> qp, uint32_t currentSwid) const{ 
 
-	auto currentIt = qp->fpdcc.pnpRecords.find(currentSwid);  
+	auto currentIt = qp->fpdcc.pnpRecords.find(currentSwid);   
 	if (currentIt == qp->fpdcc.pnpRecords.end()){
 		return false;
 	}  
 
-	const fpdcc_switch_record &current = currentIt->second;
+	const fpdcc_switch_record &current = currentIt->second;   
 	if (current.samples.size() != 2 ||
 		!std::isfinite(current.H) || current.H < 0.0 ){
 		return false;
 	}
-	
-	//entry. first is the switch number, entry. second is the record of the switch	
+		
 	for (const auto &entry : qp->fpdcc.pnpRecords){
 		if (entry.first == currentSwid){
 			continue;
@@ -1292,120 +1296,188 @@ bool RdmaHw::IsFpdccMainBottleneck( Ptr<RdmaQueuePair> qp, uint32_t currentSwid)
 	return true;
 }
 
-double RdmaHw::CalculateFpdccNewRate( Ptr<RdmaQueuePair> qp, const fpdcc_switch_record &record) const{
-	if (record.samples.size() != 2){
-		return -1.0;
-	}
-	
-	const fpdcc_pnp_sample &s1 = record.samples[0];
-	const fpdcc_pnp_sample &s2 = record.samples[1];
-	const fpdcc_pnp_sample &latest = s2;
-	const double H = record.H;
-	
-	const uint64_t deltaA = s2.A - s1.A;
-	const uint64_t deltaW = s2.W - s1.W;
-	if (deltaA == 0){
-		return -1.0;
-	}
-	
-	const double P = static_cast<double>(deltaW) / (255.0 * static_cast<double>(deltaA));  //P
-	
-	const double bottleneckBw = static_cast<double>(latest.bw); // B, bit/s
-	const double rin = H * bottleneckBw;                        // Rin, bit/s
-	const double oldRate = static_cast<double>(qp->m_rate.GetBitRate());       
-	const double flowPersistence =   static_cast<double>(CalculatePersistenceRaw(qp)) / 255.0; // p
-	const double targetQueue = static_cast<double>(m_fpdccK1); // Qt, Byte 
-	const double queueBytes = static_cast<double>(latest.qlen);   // Q, Byte 
-	
-	const int64_t deltaQ = static_cast<int64_t>(s2.qlen) - static_cast<int64_t>(s1.qlen);
-	
-	// slow down
-	if (H >= 1.0 &&  deltaQ > 0){
-	    //Predict the queue depth of the current switch
-	     const double queueGrowth = (rin - bottleneckBw) *  static_cast<double>(qp->m_baseRtt) * 1e-9/ 8.0;
-	     double currentQueue = queueBytes + queueGrowth; 
-		
-	     const double R_alter = (rin - bottleneckBw) + 8.0 * (currentQueue - targetQueue) / (static_cast<double>(qp->m_baseRtt) * 1e-9 * 2);   // *2
-	      
-	     // Continuous load in the network
-             const double persistentLoad = rin * P;   // Rin * P = Σ(Rj * pj)
-	      
-	     double newRate = oldRate;
-	     
-	     //If the total reduction amount does not exceed the continuous load, all reductions will be allocated according to the continuous responsibility of Ri * pi
-	     if (R_alter <= persistentLoad){
-	      
-	      	const double flowReduction =  R_alter *  (oldRate * flowPersistence) /  persistentLoad; 
-	      	newRate = oldRate - flowReduction;
-	      	
-	     }else {
-	      
-	        const double remainingAlter =  R_alter - persistentLoad;
+double RdmaHw::CalculateFpdccNewRate( Ptr<RdmaQueuePair> qp, const fpdcc_switch_record &record) const
+{
+    if (record.samples.size() != 2){
+        return -1.0;
+    }
 
-                const double nonPersistentLoad = rin * (1.0 - P);
+    const fpdcc_pnp_sample &s1 = record.samples[0];
+    const fpdcc_pnp_sample &s2 = record.samples[1];
+    const fpdcc_pnp_sample &latest = s2;
+    const double H = record.H;
 
-                // first
-                const double persistentReduction = oldRate * flowPersistence;
+    const uint64_t deltaA = s2.A - s1.A;
+    const uint64_t deltaW = s2.W - s1.W;
 
-                // second
-                const double extraReduction = remainingAlter * (oldRate * (1.0 - flowPersistence)) / nonPersistentLoad;
+    const double P =
+        static_cast<double>(deltaW) /
+        (255.0 * static_cast<double>(deltaA));
 
-                newRate = oldRate - persistentReduction - extraReduction;
-	      }
-	       
-	      //When the rate is negative, it becomes 1% of the line speed
-	      const double minRate = 0.01 * static_cast<double>(qp->m_max_rate.GetBitRate());
+    const double bottleneckBw =
+        static_cast<double>(latest.bw);
 
-              if (newRate < minRate){
-                 newRate = minRate;}
+    const double rin =
+        H * bottleneckBw;
 
-              return newRate;
-	}
-	
-	//Speed up
-	if(H < 1.0 &&  deltaQ <= 0){
-           const double queueGrowth = (bottleneckBw - rin) *  static_cast<double>(qp->m_baseRtt) * 1e-9/ 8.0;
-	   double currentQueue = queueBytes - queueGrowth;   
-	   if(currentQueue < 0)
-	   {
-	   	currentQueue = 0;
-	   }
-	   
-	   if(currentQueue > targetQueue)
-	   {
-	   	return oldRate;
-	   }
-	   
-	    const double R_alter = (bottleneckBw - rin) + 8.0 * (targetQueue - currentQueue) / (static_cast<double>(qp->m_baseRtt) * 1e-9 * 2);
-	    
-	    double newRate = oldRate;
-	    
-	    if (P == 1.0){
-   		 newRate = oldRate + R_alter * oldRate / rin;
-	    }else{
-	    
-	    const double nonPersistentLoad = rin * (1.0 - P);
-	    
-	    newRate = oldRate + R_alter * oldRate * (1.0 - flowPersistence) / nonPersistentLoad;
-	    }
-	    
-	    if(newRate >= static_cast<double>(qp->m_max_rate.GetBitRate()) )
-	    {
-	       newRate =  static_cast<double>(qp->m_max_rate.GetBitRate());
-	    }
-	    return newRate;
-	}
-	
-	return oldRate;
+    const double oldRate =
+        static_cast<double>(qp->m_rate.GetBitRate());
+
+    const double flowPersistence =
+        static_cast<double>(CalculatePersistenceRaw(qp)) / 255.0;
+
+    const double targetQueue =
+        m_fpdccQueueTargetRatio *
+        static_cast<double>(m_fpdccK1);
+
+    const double queueBytes =
+        static_cast<double>(latest.qlen);
+
+    const int64_t deltaQ =
+        static_cast<int64_t>(s2.qlen) -
+        static_cast<int64_t>(s1.qlen);
+
+    if (H >= 1.0 && deltaQ > 0){
+
+        const double queueGrowth =
+            (rin - bottleneckBw) *
+            static_cast<double>(qp->m_baseRtt) *
+            1e-9 / 8.0;
+
+        double currentQueue =
+            queueBytes + queueGrowth;
+
+        const double R_alter =
+            (rin - bottleneckBw) +
+            8.0 * (currentQueue - targetQueue) /
+            (static_cast<double>(qp->m_baseRtt) *
+             1e-9 * 2);
+
+        const double persistentLoad = rin * P;
+
+        double newRate = oldRate;
+
+        if (R_alter <= persistentLoad){
+
+            const double flowReduction =
+                R_alter *
+                (oldRate * flowPersistence) /
+                persistentLoad;
+
+            newRate =
+                oldRate - flowReduction;
+        }
+
+        else{
+
+            if (P == 1.0){
+
+                newRate =
+                    oldRate / H;
+            }
+
+            else{
+
+                const double remainingAlter =
+                    R_alter - persistentLoad;
+
+                const double nonPersistentLoad =
+                    rin * (1.0 - P);
+
+                const double persistentReduction =
+                    oldRate * flowPersistence;
+
+                const double extraReduction =
+                    remainingAlter *
+                    (oldRate * (1.0 - flowPersistence)) /
+                    nonPersistentLoad;
+
+                newRate =
+                    oldRate -
+                    persistentReduction -
+                    extraReduction;
+            }
+        }
+
+        const double minRate =
+            0.01 *
+            static_cast<double>(
+                qp->m_max_rate.GetBitRate());
+
+        if (newRate < minRate){
+            newRate = minRate;
+        }
+
+        return newRate;
+    }
+
+
+    if (H < 1.0 && deltaQ <= 0){
+
+        const double queueGrowth =
+            (bottleneckBw - rin) *
+            static_cast<double>(qp->m_baseRtt) *
+            1e-9 / 8.0;
+
+        double currentQueue =
+            queueBytes - queueGrowth;
+
+        if (currentQueue < 0.0){
+            currentQueue = 0.0;
+        }
+
+        if (currentQueue > targetQueue){
+            return oldRate;
+        }
+
+        double newRate = oldRate;
+
+        if (P == 1.0){
+
+            newRate =
+                oldRate / H;
+        }
+
+        else{
+
+            const double R_alter =
+                (bottleneckBw - rin) +
+                8.0 * (targetQueue - currentQueue) /
+                (static_cast<double>(qp->m_baseRtt) *
+                 1e-9 * 2);
+
+            const double nonPersistentLoad =
+                rin * (1.0 - P);
+
+            newRate =
+                oldRate +
+                R_alter *
+                oldRate *
+                (1.0 - flowPersistence) /
+                nonPersistentLoad;
+        }
+
+        if (newRate >=
+            static_cast<double>(
+                qp->m_max_rate.GetBitRate())){
+            newRate =
+                static_cast<double>(
+                    qp->m_max_rate.GetBitRate());
+        }
+
+        return newRate;
+    }
+
+    return oldRate;
 }
 
 void RdmaHw::TryFpdccRateAdjustment( Ptr<RdmaQueuePair> qp, uint32_t currentSwid){
-	auto it = qp->fpdcc.pnpRecords.find(currentSwid);  
+	auto it = qp->fpdcc.pnpRecords.find(currentSwid); 
 	if (it == qp->fpdcc.pnpRecords.end()){
 		return;
 	}
 
-	fpdcc_switch_record &record = it->second;   //Obtain the actual records of the switch, which include two PNP and H
+	fpdcc_switch_record &record = it->second;  
 	
 	if (record.samples.size() != 2 || !std::isfinite(record.H) || record.H < 0.0 ){
 		return;
@@ -1427,20 +1499,13 @@ void RdmaHw::TryFpdccRateAdjustment( Ptr<RdmaQueuePair> qp, uint32_t currentSwid
 		return;
 	}
 	
-	//Identify the main bottleneck
 	if (!IsFpdccMainBottleneck(qp, currentSwid)){
 		return;
 	}
 
 	const uint32_t latestPsn = s2.seq;
-	const bool psnFresh = latestPsn > qp->fpdcc.m_lastRecordPsn;   //Determine if PSN is valid
+	const bool psnFresh = latestPsn > qp->fpdcc.m_lastRecordPsn; 
 	
-	// If the last real action was rate increase,
-	// and explicit congestion is currently detected:
-	//
-	//     H >= 1 && ΔQ > 0
-	//
-	// then congestion is allowed to preempt immediately.
 	const bool congestionPreempt =
 		qp->fpdcc.m_lastAppliedH >= 0.0 &&
 		qp->fpdcc.m_lastAppliedH < 1.0 &&
@@ -1450,23 +1515,17 @@ void RdmaHw::TryFpdccRateAdjustment( Ptr<RdmaQueuePair> qp, uint32_t currentSwid
 		return;
 	}
 	
-	//rate adjustment
 	const double calculatedRate = CalculateFpdccNewRate(qp, record);
 	const DataRate newRate(calculatedRate);
 	
-	//If calculated rate equals current rate, no real rate adjustment occurs, do not update PSN.
 	if (newRate.GetBitRate() == oldRate){
            return;
 	}
 	
-	//Clear the information maintained by this switch after rate modification.
 	ChangeRate(qp, DataRate(calculatedRate));
 	
-
-	// Record the adopted primary bottleneck H for later check of "immediate congestion preemption after rate increase".
 	qp->fpdcc.m_lastAppliedH = record.H;;
 
-	//Set current snd_nxt as new PSN control boundary.
 	qp->fpdcc.m_lastRecordPsn = static_cast<uint32_t>(qp->snd_nxt);
 	
 	Simulator::Cancel(record.validityEvent);
@@ -1477,7 +1536,7 @@ void RdmaHw::TryFpdccRateAdjustment( Ptr<RdmaQueuePair> qp, uint32_t currentSwid
 void RdmaHw::ResetFpdccSwitchValidityTimer(
 	Ptr<RdmaQueuePair> qp,
 	uint32_t swid,
-	fpdcc_switch_record &record){  //Reset validity of the switch record.
+	fpdcc_switch_record &record){  
 
 	Simulator::Cancel(record.validityEvent);
 	record.validityEvent = Simulator::Schedule(
@@ -1488,7 +1547,7 @@ void RdmaHw::ResetFpdccSwitchValidityTimer(
 		swid);
 }
 
-void RdmaHw::InvalidateFpdccSwitchRecord(Ptr<RdmaQueuePair> qp, uint32_t swid){   //Timer expires, switch record becomes invalid.
+void RdmaHw::InvalidateFpdccSwitchRecord(Ptr<RdmaQueuePair> qp, uint32_t swid){ 
 	if (qp == NULL || qp->IsFinished()){
 		return;
 	}
@@ -1502,7 +1561,6 @@ void RdmaHw::InvalidateFpdccSwitchRecord(Ptr<RdmaQueuePair> qp, uint32_t swid){ 
 	record.H = -1.0;
 	record.samples.clear();
 	
-	
 	for (const auto &entry : qp->fpdcc.pnpRecords){
 		if (!entry.second.samples.empty()){
 			return;
@@ -1512,15 +1570,20 @@ void RdmaHw::InvalidateFpdccSwitchRecord(Ptr<RdmaQueuePair> qp, uint32_t swid){ 
 	const uint64_t oldRate = qp->m_rate.GetBitRate();
 	const uint64_t lineRate = qp->m_max_rate.GetBitRate();
 	
-	const uint64_t recoveryRate = static_cast<uint64_t>( static_cast<double>(lineRate));  //400
+	const uint64_t recoveryRate =
+		static_cast<uint64_t>(
+			static_cast<double>(lineRate));
 	
 	if (oldRate >= recoveryRate){
 		return;
 	}
 
 	ChangeRate(qp, DataRate(recoveryRate));
+
 	qp->fpdcc.m_lastAppliedH = 0.0;
+
 	qp->fpdcc.m_lastRecordPsn = static_cast<uint32_t>(qp->snd_nxt);
+
 }
 
 

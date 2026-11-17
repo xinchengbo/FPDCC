@@ -21,25 +21,22 @@ class SwitchNode : public Node {
 	static const uint32_t qCnt = 8;
 
 	enum class CcNetState : uint8_t {
-		IN = 0,   // Idle Network
-		CN = 1,   // Congested network
-		NN = 2    // Normal network
+		IN = 0,  
+		CN = 1,  
+		NN = 2    
 	};
 
 	struct CcQueueState {
-		//A: Cumulative number of bytes of DATA packets that have successfully entered the current egress queue
+		// A
 		uint64_t inBytes;
 
-		// W：Payload × p
+		// W
 		uint64_t weightedBytes;
 
-		//Snapshot A at the previous Te boundary
 		uint64_t lastInBytes;
 
-		//netState
 		CcNetState netState;
-
-		// IN：1-U；NN：0；CN：[K1,K2)内为(Q-K1)/(K2-K1)，Q>=K2时为1。
+		
 		double feedbackProb;
 
 		CcQueueState()
@@ -64,8 +61,8 @@ class SwitchNode : public Node {
 
 	CcQueueState m_ccState[pCnt][qCnt];
 
-	//FPDCC parameters
-	uint64_t m_ccNs;       // Te
+	//Te
+	uint64_t m_ccNs;    
 
 protected:
 	bool m_ecnEnabled;
@@ -81,16 +78,18 @@ private:
 	void CheckAndSendPfc(uint32_t inDev, uint32_t qIndex);
 	void CheckAndSendResume(uint32_t inDev, uint32_t qIndex);
 
-
-	//Calculate the pressure U based on the successful joining rate of the current queue during the current cycle, 
-	//and then update the unique state and feedback probability in combination with the end of cycle Q.
 	void UpdateCcState(void);
 
-	CcNetState DetermineCcState(double pressure, uint64_t queueBytes, uint64_t k1) const;
+	CcNetState DetermineCcState(double pressure,
+						uint64_t queueBytes,
+						uint64_t k1) const;
 
-	double CalcCcProb(CcNetState state, double pressure, uint64_t queueBytes, uint64_t k1, uint64_t k2) const;
+	double CalcCcProb(CcNetState state,
+					  double pressure,
+					  uint64_t queueBytes,
+					  uint64_t k1,
+					  uint64_t k2) const;
 
-	//Each package is independently sampled
 	bool ShouldSendPnp(uint32_t ifIndex, uint32_t qIndex) const;
 
 public:
@@ -103,8 +102,12 @@ public:
 	void AddTableEntry(Ipv4Address &dstAddr, uint32_t intf_idx);
 	void ClearTable();
 
-	bool SwitchReceiveFromDevice(Ptr<NetDevice> device, Ptr<Packet> packet,  CustomHeader &ch);
-	void SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Packet> p);
+	bool SwitchReceiveFromDevice(Ptr<NetDevice> device,
+								 Ptr<Packet> packet,
+								 CustomHeader &ch);
+	void SwitchNotifyDequeue(uint32_t ifIndex,
+							 uint32_t qIndex,
+							 Ptr<Packet> p);
 
 	Ptr<Packet> GenEnp(Ptr<Packet> ori_pkt,
 					   CustomHeader &ch,
@@ -116,13 +119,12 @@ public:
 					   uint32_t qlen,
 					   uint64_t A,
 					   uint64_t W,
-					   uint64_t bw,
-					   uint8_t Z);
+					   uint64_t bw);
 
 	int logres_shift(int b, int l);
 	int log2apprx(int x, int b, int m, int l);
 
-	void StartCc(void);  //Start cycle status update task
+	void StartCc(void); 
 };
 
 } // namespace ns3

@@ -15,7 +15,7 @@
 #include <iostream>
 #include <fstream>
 #include <iomanip>
-#include "ns3/random-variable.h" 
+#include "ns3/random-variable.h"   
 #include "pnp-header.h"
 #include "ns3/core-module.h"
 
@@ -50,7 +50,8 @@ TypeId SwitchNode::GetTypeId (void)
 			"CC_MODE=12 state update interval in ns.",
 			UintegerValue(2000),
 			MakeUintegerAccessor(&SwitchNode::m_ccNs),
-			MakeUintegerChecker<uint64_t>());
+			MakeUintegerChecker<uint64_t>())
+  ;
   return tid;
 }
 
@@ -70,7 +71,6 @@ SwitchNode::SwitchNode(){
 		m_u[i] = 0;
 }
 
-//Initiate FPDCC cycle state calculation
 void SwitchNode::StartCc(void){
 	if (m_ccMode != 12 || m_ccNs == 0)
 		return;
@@ -78,7 +78,7 @@ void SwitchNode::StartCc(void){
 	uint32_t nDev = GetNDevices();
 	if (nDev > pCnt)
 		nDev = pCnt;
-
+		
 	for (uint32_t outPort = 0; outPort < nDev; ++outPort){
 		for (uint32_t qIndex = 1; qIndex < qCnt; ++qIndex){
 			CcQueueState &state = m_ccState[outPort][qIndex];
@@ -91,7 +91,9 @@ void SwitchNode::StartCc(void){
 	Simulator::Schedule(NanoSeconds(m_ccNs), &SwitchNode::UpdateCcState, this);
 }
 
-SwitchNode::CcNetState SwitchNode::DetermineCcState(double pressure, uint64_t queueBytes, uint64_t k1) const{
+SwitchNode::CcNetState SwitchNode::DetermineCcState(double pressure,
+                                                       uint64_t queueBytes,
+                                                       uint64_t k1) const{
 	if (pressure < 1.0){
 		return (queueBytes < k1) ? CcNetState::IN : CcNetState::NN;
 	}
@@ -99,28 +101,39 @@ SwitchNode::CcNetState SwitchNode::DetermineCcState(double pressure, uint64_t qu
 	return (queueBytes >= k1) ? CcNetState::CN : CcNetState::NN;
 }
 
-//Calculate feedback probability
-double SwitchNode::CalcCcProb(CcNetState state, double pressure ，uint64_t queueBytes, uint64_t k1, uint64_t k2) const{
+//P
+double SwitchNode::CalcCcProb(CcNetState state,
+                                  double pressure,
+                                  uint64_t queueBytes,
+                                  uint64_t k1,
+                                  uint64_t k2) const{
 	switch (state){
-	case CcNetState::IN: return 1.0 - pressure;
-	case CcNetState::NN: return 0.0;
+	case CcNetState::IN:
+		return 1.0 - pressure;
+
+	case CcNetState::NN:
+		return 0.0;
+
 	case CcNetState::CN:
-		if (queueBytes >= k2) return 1.0;
-		return static_cast<double>(queueBytes - k1) / static_cast<double>(k2 - k1);
+		if (queueBytes >= k2)
+			return 1.0;
+		return static_cast<double>(queueBytes - k1) /
+			static_cast<double>(k2 - k1);
 	}
-	NS_ASSERT_MSG(false, "Unknown network state");
+
+	NS_ASSERT_MSG(false, "Unknown FPDCC network state");
 	return 0.0;
 }
 
 bool SwitchNode::ShouldSendPnp(uint32_t ifIndex, uint32_t qIndex) const{
 	const CcQueueState &state = m_ccState[ifIndex][qIndex];
-	if (state.netState == CcNetState::NN)
+
+	if (state.netState == CcNetState::NN || state.feedbackProb <= 0.0)
 		return false;
 
 	return UniformVariable(0.0, 1.0).GetValue() < state.feedbackProb;
 }
 
-//Update network status
 void SwitchNode::UpdateCcState(void){
 	if (m_ccMode != 12 || m_ccNs == 0)
 		return;
@@ -138,16 +151,27 @@ void SwitchNode::UpdateCcState(void){
 		if (C == 0)
 			continue;
 
+		//K1=Kmin，K2=Kmax。
 		const uint64_t k1 = m_mmu->GetKmin(outPort);
 		const uint64_t k2 = m_mmu->GetKmax(outPort);
+		NS_ABORT_MSG_IF(k1 == 0 || k2 <= k1,
+			"FPDCC requires valid MMU Kmin/Kmax with Kmax > Kmin");
 
 		for (uint32_t qIndex = 1; qIndex < qCnt; ++qIndex){
 			CcQueueState &state = m_ccState[outPort][qIndex];
+
 			const uint64_t windowInBytes = state.inBytes - state.lastInBytes;
-			const double pressure = static_cast<double>(windowInBytes) * 8.0 * 1e9 / (static_cast<double>(C) * static_cast<double>(m_ccNs));
-			const uint64_t qBytes = m_mmu->egress_bytes[outPort][qIndex];  //Q。
+
+			const double pressure =
+				static_cast<double>(windowInBytes) * 8.0 * 1e9 /
+				(static_cast<double>(C) * static_cast<double>(m_ccNs));
+
+			const uint64_t qBytes = m_mmu->egress_bytes[outPort][qIndex];
+
 			state.netState = DetermineCcState(pressure, qBytes, k1);
-			state.feedbackProb = CalcCcProb(state.netState, pressure, qBytes, k1, k2); //p
+			state.feedbackProb =
+				CalcCcProb(state.netState, pressure, qBytes, k1, k2);
+
 			state.lastInBytes = state.inBytes;
 		}
 	}
@@ -201,11 +225,10 @@ void SwitchNode::CheckAndSendResume(uint32_t inDev, uint32_t qIndex){
 
 
 void SwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch){
-    int idx = GetOutDev(p, ch); 
+    int idx = GetOutDev(p, ch);    
     if (idx >= 0){
 		NS_ASSERT_MSG(m_devices[idx]->IsLinkUp(), "The routing table look up should return link that is up");
 
-		// determine the qIndex
 		uint32_t qIndex;
 		if (ch.l3Prot == 0xFF || ch.l3Prot == 0xFE || ch.l3Prot == 0xF2 ||
 			(m_ackHighPrio && (ch.l3Prot == 0xFD || ch.l3Prot == 0xFC))){
@@ -214,12 +237,12 @@ void SwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch){
 			qIndex = (ch.l3Prot == 0x06 ? 1 : ch.udp.pg); // if TCP, put to queue 1
 		}
 
-		// admission control
+		// admission control  
 		FlowIdTag t;
 		p->PeekPacketTag(t);
 		uint32_t inDev = t.GetFlowId();
 
-        if (qIndex != 0){ //not highest priority
+        if (qIndex != 0){ //not highest priority   
            //-------------------- ENCC--------------------------------
 			if (m_ccMode == 11) {
 				uint32_t qlen = m_mmu->egress_bytes[idx][qIndex];
@@ -236,22 +259,27 @@ void SwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch){
 			   m_mmu->UpdateIngressAdmission(inDev, qIndex, p->GetSize());
 			   m_mmu->UpdateEgressAdmission(idx, qIndex, p->GetSize());
 			}else{
-				return; // Drop
+				return; // Drop 丢包
 			}
 
+			// FPDCC
 			if (m_ccMode == 12 && ch.l3Prot == 0x11){
 				const uint64_t pktBytes = p->GetSize();
 				const uint8_t persistenceRaw = ch.udp.ih.GetPersistence();
 				CcQueueState &state = m_ccState[idx][qIndex];
 
-				state.inBytes += pktBytes; //A
-				state.weightedBytes += pktBytes * static_cast<uint64_t>(persistenceRaw); //W
+				state.inBytes += pktBytes;
+				state.weightedBytes +=
+					pktBytes * static_cast<uint64_t>(persistenceRaw);
 
 				if (ShouldSendPnp(idx, qIndex)){
-					Ptr<QbbNetDevice> dev = DynamicCast<QbbNetDevice>(m_devices[idx]);
-					Ptr<QbbNetDevice> pnpOutDev = DynamicCast<QbbNetDevice>(m_devices[inDev]);
+					Ptr<QbbNetDevice> dev =
+						DynamicCast<QbbNetDevice>(m_devices[idx]);
+					Ptr<QbbNetDevice> pnpOutDev =
+						DynamicCast<QbbNetDevice>(m_devices[inDev]);
 
-					const uint64_t queueBytes = m_mmu->egress_bytes[idx][qIndex];
+					const uint64_t queueBytes =
+						m_mmu->egress_bytes[idx][qIndex];
 
 					Ptr<Packet> pnp = GenPnp(
 						p,
@@ -259,8 +287,7 @@ void SwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch){
 						static_cast<uint32_t>(queueBytes),
 						state.inBytes,
 						state.weightedBytes,
-						dev->GetDataRate().GetBitRate(),
-						static_cast<uint8_t>(state.netState));    //PNP
+						dev->GetDataRate().GetBitRate());
 
 					pnpOutDev->SendPnp(pnp, ch);
 				}
@@ -306,10 +333,15 @@ Ptr<Packet> SwitchNode::GenEnp(Ptr<Packet> ori_pkt, CustomHeader & ch, uint32_t 
     return enp;
 }
 
-//Generate pnp feedback package
-Ptr<Packet> SwitchNode::GenPnp(Ptr<Packet> ori_pkt, CustomHeader &ch, uint32_t qlen, uint64_t A, uint64_t W, uint64_t bw) {
-    	(void)ori_pkt;
-    	PnpHeader pnp_hdr;
+// PNP 
+Ptr<Packet> SwitchNode::GenPnp(Ptr<Packet> ori_pkt,
+                               CustomHeader &ch,
+			       uint32_t qlen,
+                               uint64_t A,
+                               uint64_t W,
+                               uint64_t bw) {
+    (void)ori_pkt;
+    PnpHeader pnp_hdr;
 
 	pnp_hdr.SetSwId(m_id);
 	pnp_hdr.SetTs(Simulator::Now().GetTimeStep());
@@ -322,10 +354,11 @@ Ptr<Packet> SwitchNode::GenPnp(Ptr<Packet> ori_pkt, CustomHeader &ch, uint32_t q
     pnp_hdr.SetQId(ch.udp.pg);
     pnp_hdr.SetSeq(ch.udp.seq);
 
-    Ptr<Packet> pnp = Create<Packet>( std::max(64 - 14 - 20 - static_cast<int>(PnpHeader::GetStaticSize()), 0));
+    Ptr<Packet> pnp = Create<Packet>(
+        std::max(64 - 14 - 20 - static_cast<int>(PnpHeader::GetStaticSize()), 0));
     pnp->AddHeader(pnp_hdr);
 
-    //Constructing a Reverse IPv4 Header
+    // -------------------- 构造反向 IPv4 Header --------------------
     Ipv4Header ipv4;
     ipv4.SetDestination(Ipv4Address(ch.sip));
     ipv4.SetSource(Ipv4Address(ch.dip));
